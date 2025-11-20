@@ -1,23 +1,23 @@
-
 """
-AI Laundry Sorter – Streamlit Demo (4-Head Model, Google Drive weights)
+AI Laundry Sorter – Streamlit Demo (4-Head Model)
 
 This app:
-  • Loads the trained multitask ConvNeXt model (COLOR + FABRIC + WASH_CYCLE + IS_CLOTHING)
+  • Loads a trained 4-head ConvNeXt model
+      - COLOR
+      - FABRIC
+      - WASH_CYCLE
+      - IS_CLOTHING
   • Accepts a single clothing image as input
   • Predicts:
         - Color group   (LIGHT / DARK / COLOR / COLORFUL)
-        - Fabric group  (COTTON / LINEN / WOOL / SILK / SYNTHETIC)
-        - Washing program (human-readable text, no numeric labels in UI)
-  • Uses the IS_CLOTHING head + confidence heuristics to reject clearly non-garment images
-
-Model weights are downloaded once from Google Drive using the public share link.
+        - Fabric group  (COTTON / LINEN / WOOL / SILK / SYNTHETIC, ...)
+        - Washing program (human-readable text)
+  • Uses IS_CLOTHING + confidence thresholds to reject clearly non-garment images.
 """
 
 import os
 import io
 import datetime
-import requests
 
 import pandas as pd
 from PIL import Image
@@ -27,65 +27,69 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torchvision import transforms
 import timm
-
 import streamlit as st
 
+
 # ============================================================
-# 0) Paths & Google Drive config
+# 0) Core paths and model download from Google Drive
 # ============================================================
-ROOT_DIR   = os.path.dirname(os.path.abspath(__file__))
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-LABELS_CSV = os.path.join(ROOT_DIR, "wash_labels.csv")
-HEADER_IMG = os.path.join(ROOT_DIR, "ai.jpg")
+# Files that must be present in the GitHub repo
+LABELS_CSV = os.path.join(BASE_DIR, "wash_labels.csv")
+HEADER_IMG = os.path.join(BASE_DIR, "ai.jpg")          # optional, can be missing
+DEMO_LOG   = os.path.join(BASE_DIR, "demo_usage_log.csv")
 
-# محلی که مدل دانلودشده را ذخیره می‌کنیم
-CKPT_PATH  = os.path.join(ROOT_DIR, "best_model_wash.pt")
+# Model will be downloaded here from Google Drive if not present
+CKPT_PATH  = os.path.join(BASE_DIR, "best_model3_wash.pt")
 
-# فایل لاگ استفاده از دمو
-DEMO_LOG   = os.path.join(ROOT_DIR, "demo_usage_log.csv")
-
-# Google Drive file ID (از share-link تو گرفته شده)
-# Link: https://drive.google.com/file/d/1TxEEeU-uTVS-SYq4uzZISDr4gj7CFUsx/view?usp=drive_link
+# ---- Google Drive model file ID (from your share link) ----
+# Link: https://drive.google.com/file/d/1TxEEeU-uTVS-SYq4uzZISDr4gj7CFUsx/view
 GDRIVE_FILE_ID = "1TxEEeU-uTVS-SYq4uzZISDr4gj7CFUsx"
 
-assert os.path.exists(LABELS_CSV), f"Labels CSV not found: {LABELS_CSV}"
 
-
-# ============================================================
-# 0.1) Helper: download model weights from Google Drive if needed
-# ============================================================
-def download_file_from_google_drive(file_id: str, destination: str):
+def ensure_model_downloaded():
     """
-    Minimal Google Drive downloader using `requests`.
-    Assumes the file is shared as 'Anyone with link'.
-    """
-    url = "https://drive.google.com/uc?export=download"
-    params = {"id": file_id}
-    with requests.get(url, params=params, stream=True) as r:
-        r.raise_for_status()
-        with open(destination, "wb") as f:
-            for chunk in r.iter_content(chunk_size=8192):
-                if chunk:
-                    f.write(chunk)
-
-
-def ensure_checkpoint_present():
-    """
-    If best_model_wash.pt is not present locally, download it from Google Drive.
+    Download the model checkpoint from Google Drive using gdown
+    if it does not yet exist in the app folder.
     """
     if os.path.exists(CKPT_PATH):
         return
-    os.makedirs(os.path.dirname(CKPT_PATH), exist_ok=True)
-    print("Downloading model weights from Google Drive...")
-    download_file_from_google_drive(GDRIVE_FILE_ID, CKPT_PATH)
-    print("Model downloaded to:", CKPT_PATH)
 
+    try:
+        import gdown
+    except ImportError:
+        st.error(
+            "The 'gdown' package is not installed. "
+            "Please add 'gdown' to requirements.txt."
+        )
+        raise
+
+    url = f"https://drive.google.com/uc?id={GDRIVE_FILE_ID}"
+    st.write("Downloading model weights from Google Drive...")
+    gdown.download(url, CKPT_PATH, quiet=False)
+
+    if not os.path.exists(CKPT_PATH):
+        raise FileNotFoundError("Model download failed – checkpoint file not found.")
+
+
+# Ensure labels CSV exists
+if not os.path.exists(LABELS_CSV):
+    raise FileNotFoundError(
+        f"wash_labels.csv not found at: {LABELS_CSV}. "
+        "Place wash_labels.csv in the same folder as app.py."
+    )
+
+# Make sure model is present (download if needed)
+ensure_model_downloaded()
 
 # ============================================================
-# 1) Label metadata (for mapping indices → names)
+# 1) Label metadata (mapping indices → names)
 # ============================================================
 df_all = pd.read_csv(LABELS_CSV)
-assert "is_clothing" in df_all.columns, "Column 'is_clothing' missing in wash_labels.csv"
+
+if "is_clothing" not in df_all.columns:
+    raise KeyError("Column 'is_clothing' is missing in wash_labels.csv")
 
 # ---------------- Clothing subset for COLOR / FABRIC heads -------------
 df_clothing = df_all[df_all["is_clothing"] == 1].copy()
@@ -96,35 +100,33 @@ df_clothing["fabric_label"] = df_clothing["fabric_label"].astype(int)
 num_color_classes  = df_clothing["color_label"].nunique()
 num_fabric_classes = df_clothing["fabric_label"].nunique()
 
-# ---------------- WASH_CYCLE head: use ALL rows (۵ کلاس) ---------------
-wash_all = df_all[["wash_cycle_label", "wash_cycle"]].dropna(subset=["wash_cycle_label", "wash_cycle"]).copy()
+# ---------------- WASH_CYCLE head: use ALL rows (5 classes) ------------
+wash_all = df_all[["wash_cycle_label", "wash_cycle"]].dropna(
+    subset=["wash_cycle_label", "wash_cycle"]
+).copy()
 wash_all["wash_cycle_label"] = wash_all["wash_cycle_label"].astype(int)
 
-num_wash_classes    = wash_all["wash_cycle_label"].nunique()  # باید 5 باشد
-num_iscloth_classes = 2  # {0: NON_CLOTHING, 1: CLOTHING}
-
-print("num_color_classes :", num_color_classes)
-print("num_fabric_classes:", num_fabric_classes)
-print("num_wash_classes  :", num_wash_classes)
+num_wash_classes    = wash_all["wash_cycle_label"].nunique()  # should be 5
+num_iscloth_classes = 2  # 0=NON_CLOTHING, 1=CLOTHING
 
 # Clean mappings: label → name
 color_map_df  = df_clothing[["color_label",  "color_group"]].drop_duplicates()
 fabric_map_df = df_clothing[["fabric_label", "fabric_group"]].drop_duplicates()
 wash_map_df   = wash_all[["wash_cycle_label", "wash_cycle"]].drop_duplicates()
 
-color_map  = dict(zip(color_map_df["color_label"],  color_map_df["color_group"]))
+color_map  = dict(zip(color_map_df["color_label"],  color_map_df["color_group"]  ))
 fabric_map = dict(zip(fabric_map_df["fabric_label"], fabric_map_df["fabric_group"]))
 wash_map   = dict(zip(wash_map_df["wash_cycle_label"], wash_map_df["wash_cycle"]))
 
-# Optional: richer verbal descriptions for washing programs
-# Make sure keys here match your actual 'wash_cycle' strings.
+# Optional: richer verbal descriptions for washing programs.
+# Make sure keys here match the exact strings in wash_cycle column.
 wash_full_description = {
     "wool/delicate":       "Wool / Delicate – ~20°C, ultra-gentle agitation, very low spin.",
     "delicate/hand-wash":  "Delicate / Hand-wash – 20–30°C, gentle cycle, low spin, ideal for silk and fine fabrics.",
     "normal":              "Normal – 30–40°C, standard agitation and spin for everyday cotton/synthetics.",
     "normal/delicate":     "Normal / Delicate – 30°C, slightly gentler mechanical action, medium spin.",
     "synthetic/easy-care": "Synthetic / Easy-care – 30°C, anti-crease profile, moderate spin.",
-    # اگر اسم‌های دیگری در CSV داری اینجا اضافه/اصلاح کن
+    # Add/adjust keys if your CSV has different names
 }
 
 # ============================================================
@@ -149,8 +151,9 @@ class WashMultiTaskConvNeXt(nn.Module):
     Multitask ConvNeXt backbone (4 heads):
       • head_color      → color_group classification
       • head_fabric     → fabric_group classification
-      • head_wash_cycle → wash_cycle classification (۵ کلاس)
+      • head_wash_cycle → wash_cycle classification (5 classes)
       • head_is_cloth   → is_clothing (0 = NON_CLOTHING, 1 = CLOTHING)
+    Must match the architecture used in training.
     """
     def __init__(self, num_color, num_fabric, num_wash, num_iscloth=2):
         super().__init__()
@@ -176,22 +179,19 @@ class WashMultiTaskConvNeXt(nn.Module):
         return logits_color, logits_fabric, logits_wash_cycle, logits_is_cloth
 
 
-# روی استریم‌لیت کلود عملاً روی CPU اجرا می‌شود
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-# مطمئن شو فایل مدل لوکال است؛ اگر نیست از گوگل‌درایو بگیر
-ensure_checkpoint_present()
-
+device = torch.device("cpu")  # Streamlit Cloud will typically run on CPU
 model = WashMultiTaskConvNeXt(
     num_color=num_color_classes,
     num_fabric=num_fabric_classes,
-    num_wash=num_wash_classes,
+    num_wash=num_wash_classes,   # matches checkpoint (5)
     num_iscloth=num_iscloth_classes,
 ).to(device)
 
+# Load checkpoint
 state_dict = torch.load(CKPT_PATH, map_location=device)
 model.load_state_dict(state_dict)
 model.eval()
+
 
 # ============================================================
 # 3) Single-image prediction helper
@@ -217,7 +217,7 @@ def predict_single_image(pil_img: Image.Image):
         probs_c  = F.softmax(logits_c, dim=1)
         probs_f  = F.softmax(logits_f, dim=1)
         probs_w  = F.softmax(logits_w, dim=1)
-        probs_is = F.softmax(logits_is, dim=1)  # shape: [1, 2]
+        probs_is = F.softmax(logits_is, dim=1)  # [1, 2]
 
         max_pc, idx_c = probs_c.max(dim=1)
         max_pf, idx_f = probs_f.max(dim=1)
@@ -263,6 +263,7 @@ def predict_single_image(pil_img: Image.Image):
         "wash":   full_wash_text,
     }
 
+
 # ============================================================
 # 4) Streamlit application
 # ============================================================
@@ -273,14 +274,13 @@ def main():
         layout="centered",
     )
 
-    # Optional header image
     if os.path.exists(HEADER_IMG):
         st.image(HEADER_IMG, use_container_width=True)
 
     st.title("AI Laundry Sorter")
     st.caption(
         "Multitask ConvNeXt (4-head) for automatic color, fabric, "
-        "and washing program recommendations."
+        "and washing-program recommendations."
     )
 
     uploaded_file = st.file_uploader(
@@ -305,7 +305,7 @@ def main():
             st.markdown(f"**Fabric Group:** {result['fabric']}")
             st.markdown(f"**Wash Program:** {result['wash']}")
 
-        # Log usage
+        # Log usage locally (optional)
         ts = datetime.datetime.now().isoformat(timespec="seconds")
         log_row = pd.DataFrame([{
             "timestamp":   ts,
@@ -315,15 +315,20 @@ def main():
             "pred_wash":   result["wash"],
         }])
 
-        if os.path.exists(DEMO_LOG):
-            old = pd.read_csv(DEMO_LOG)
-            pd.concat([old, log_row], ignore_index=True).to_csv(DEMO_LOG, index=False)
-        else:
-            log_row.to_csv(DEMO_LOG, index=False)
+        try:
+            if os.path.exists(DEMO_LOG):
+                old = pd.read_csv(DEMO_LOG)
+                pd.concat([old, log_row], ignore_index=True).to_csv(DEMO_LOG, index=False)
+            else:
+                log_row.to_csv(DEMO_LOG, index=False)
+        except Exception:
+            # If logging fails on Streamlit Cloud (read-only FS), just ignore
+            pass
 
-        st.success("Prediction logged.")
+        st.success("Prediction done.")
     else:
         st.info("Upload a garment image to receive an automatic washing recommendation.")
+
 
 if __name__ == "__main__":
     main()
