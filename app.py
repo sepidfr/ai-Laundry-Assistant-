@@ -113,24 +113,37 @@ if df_clothing.empty:
     st.error("No clothing rows found (`is_clothing == 1`) in `wash_labels.csv`.")
     st.stop()
 
+# Drop rows with missing labels to avoid IntCastingNaNError
+df_clothing = df_clothing.dropna(subset=["color_label", "fabric_label"])
+
+if df_clothing.empty:
+    st.error(
+        "After dropping rows with missing `color_label`/`fabric_label`, "
+        "no clothing rows remain in `wash_labels.csv`."
+    )
+    st.stop()
+
 df_clothing["color_label"]  = df_clothing["color_label"].astype(int)
 df_clothing["fabric_label"] = df_clothing["fabric_label"].astype(int)
 
 num_color_classes  = df_clothing["color_label"].nunique()
 num_fabric_classes = df_clothing["fabric_label"].nunique()
 
-# ---------- WASH_CYCLE head: use ALL rows (5 classes) ----------
+# ---------- WASH_CYCLE head: use ALL rows ----------
 wash_all = df_all[["wash_cycle_label", "wash_cycle"]].dropna(
     subset=["wash_cycle_label", "wash_cycle"]
 ).copy()
 wash_all["wash_cycle_label"] = wash_all["wash_cycle_label"].astype(int)
 
-num_wash_classes    = wash_all["wash_cycle_label"].nunique()  # should be 5
+# ⚠ VERY IMPORTANT:
+# The checkpoint `best_model3_wash.pt` was trained with 5 wash-cycle classes.
+# So we must keep num_wash_classes = 5 here, even if the CSV currently has fewer labels.
+num_wash_classes    = 5
 num_iscloth_classes = 2  # {0: NON_CLOTHING, 1: CLOTHING}
 
 # Clean mappings: label → name
-color_map_df  = df_clothing[["color_label",  "color_group"]].drop_duplicates()
-fabric_map_df = df_clothing[["fabric_label", "fabric_group"]].drop_duplicates()
+color_map_df  = df_clothing[["color_label",  "color_group"]].dropna(subset=["color_group"]).drop_duplicates()
+fabric_map_df = df_clothing[["fabric_label", "fabric_group"]].dropna(subset=["fabric_group"]).drop_duplicates()
 wash_map_df   = wash_all[["wash_cycle_label", "wash_cycle"]].drop_duplicates()
 
 color_map  = dict(zip(color_map_df["color_label"],  color_map_df["color_group"]))
@@ -204,7 +217,7 @@ device = torch.device("cpu")
 model = WashMultiTaskConvNeXt(
     num_color=num_color_classes,
     num_fabric=num_fabric_classes,
-    num_wash=num_wash_classes,   # should match checkpoint (5)
+    num_wash=num_wash_classes,   # must match checkpoint (5)
     num_iscloth=num_iscloth_classes,
 ).to(device)
 
