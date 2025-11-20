@@ -4,6 +4,5 @@ torchvision
 timm
 pandas
 numpy
-matplotlib
 Pillow
-scikit-learn
+gdown
