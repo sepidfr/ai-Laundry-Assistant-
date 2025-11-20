@@ -1,4 +1,4 @@
-%%writefile app.py
+
 """
 AI Laundry Sorter – Streamlit Demo (4-Head Model, Google Drive weights)
 
