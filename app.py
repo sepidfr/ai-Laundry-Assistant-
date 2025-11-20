@@ -12,7 +12,8 @@ This app:
         - Color group   (LIGHT / DARK / COLOR / COLORFUL)
         - Fabric group  (COTTON / LINEN / WOOL / SILK / SYNTHETIC, ...)
         - Washing program (human-readable text)
-  • Uses IS_CLOTHING + confidence thresholds to reject clearly non-garment images.
+  • Uses IS_CLOTHING + confidence thresholds + a smart rule-based gate
+    to reject clearly non-garment images.
 """
 
 import os
@@ -63,9 +64,9 @@ def ensure_model_downloaded():
     Download the model checkpoint from Google Drive using gdown
     if it does not yet exist in the app folder.
 
-    مهم:
-    - فایل Drive باید share شده باشد روی:
-      'Anyone with the link' -> Viewer
+    Important:
+    - The Drive file must be shared as:
+      'Anyone with the link' -> Viewer.
     """
     if os.path.exists(CKPT_PATH):
         return
@@ -82,7 +83,7 @@ def ensure_model_downloaded():
     st.info("Downloading model weights from Google Drive... (this may take a moment)")
 
     try:
-        # استفاده مستقیم از id، نه URL خام
+        # Use direct id=... instead of raw URL
         gdown.download(id=GDRIVE_FILE_ID, output=CKPT_PATH, quiet=False)
     except Exception as e:
         st.error(
@@ -248,6 +249,11 @@ model.eval()
 def predict_single_image(pil_img: Image.Image):
     """
     Run the trained multitask model on a single PIL image.
+
+    Smart gate logic:
+      - If p(is_clothing) < 0.55 -> No garment.
+      - OR if both color & fabric confidences are very low (< 0.35),
+        we also treat it as non-garment (phone, face, random object).
     """
     x = demo_transform(pil_img).unsqueeze(0).to(device)
 
@@ -267,10 +273,13 @@ def predict_single_image(pil_img: Image.Image):
         max_pf = max_pf.item()
         max_pw = max_pw.item()
 
+        # Probability image contains clothing (class 1)
         p_is_cloth = probs_is[0, 1].item()
 
-        # ---------- IS_CLOTHING gate (softer: 0.5) ----------
-        if p_is_cloth < 0.50:
+        # --------- SMART NON-GARMENT GATE ----------
+        # 1) Not confident that this is clothing
+        # 2) AND/OR color + fabric predictions are too uncertain
+        if (p_is_cloth < 0.55) or (max_pc < 0.35 and max_pf < 0.35):
             return {
                 "color":  "No garment detected",
                 "fabric": "No garment detected",
