@@ -5,4 +5,4 @@ pillow
 pandas
 numpy
 timm
-gdown
+requests
