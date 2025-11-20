@@ -12,8 +12,8 @@ This app:
         - Color group   (LIGHT / DARK / COLOR / COLORFUL)
         - Fabric group  (COTTON / LINEN / WOOL / SILK / SYNTHETIC, ...)
         - Washing program (human-readable text)
-  • Uses IS_CLOTHING + a strong rule-based gate
-    to reject clearly non-garment images (phone cover, face, objects).
+  • Uses IS_CLOTHING + confidence thresholds + a smart rule-based gate
+    to reject clearly non-garment images.
 """
 
 import os
@@ -46,14 +46,16 @@ except ModuleNotFoundError as e:
 # ============================================================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
+# Local files expected in the repo
 LABELS_CSV = os.path.join(BASE_DIR, "wash_labels.csv")
 HEADER_IMG = os.path.join(BASE_DIR, "ai.jpg")              # optional
 DEMO_LOG   = os.path.join(BASE_DIR, "demo_usage_log.csv")
 
+# Model checkpoint will be saved with this name locally
 CKPT_PATH  = os.path.join(BASE_DIR, "best_model3_wash.pt")
 
-# Google Drive file ID (your link)
-# https://drive.google.com/file/d/1TxEEeU-uTVS-SYq4uzZISDr4gj7CFUsx/view?usp=drive_link
+# Google Drive file ID for the model
+# Link: https://drive.google.com/file/d/1TxEEeU-uTVS-SYq4uzZISDr4gj7CFUsx/view?usp=drive_link
 GDRIVE_FILE_ID = "1TxEEeU-uTVS-SYq4uzZISDr4gj7CFUsx"
 
 
@@ -61,6 +63,10 @@ def ensure_model_downloaded():
     """
     Download the model checkpoint from Google Drive using gdown
     if it does not yet exist in the app folder.
+
+    Important:
+    - The Drive file must be shared as:
+      'Anyone with the link' -> Viewer.
     """
     if os.path.exists(CKPT_PATH):
         return
@@ -77,6 +83,7 @@ def ensure_model_downloaded():
     st.info("Downloading model weights from Google Drive... (this may take a moment)")
 
     try:
+        # Use direct id=... instead of raw URL
         gdown.download(id=GDRIVE_FILE_ID, output=CKPT_PATH, quiet=False)
     except Exception as e:
         st.error(
@@ -106,7 +113,7 @@ if not os.path.exists(LABELS_CSV):
     )
     st.stop()
 
-# Download model if needed
+# Make sure model checkpoint is present (download if needed)
 ensure_model_downloaded()
 
 # ============================================================
@@ -118,11 +125,13 @@ if "is_clothing" not in df_all.columns:
     st.error("Column `is_clothing` is missing in `wash_labels.csv`.")
     st.stop()
 
+# ---------- Clothing subset for COLOR / FABRIC heads ----------
 df_clothing = df_all[df_all["is_clothing"] == 1].copy()
 if df_clothing.empty:
     st.error("No clothing rows found (`is_clothing == 1`) in `wash_labels.csv`.")
     st.stop()
 
+# Drop rows with missing labels to avoid IntCastingNaNError
 df_clothing = df_clothing.dropna(subset=["color_label", "fabric_label"])
 if df_clothing.empty:
     st.error(
@@ -137,14 +146,17 @@ df_clothing["fabric_label"] = df_clothing["fabric_label"].astype(int)
 num_color_classes  = df_clothing["color_label"].nunique()
 num_fabric_classes = df_clothing["fabric_label"].nunique()
 
+# ---------- WASH_CYCLE head ----------
 wash_all = df_all[["wash_cycle_label", "wash_cycle"]].dropna(
     subset=["wash_cycle_label", "wash_cycle"]
 ).copy()
 wash_all["wash_cycle_label"] = wash_all["wash_cycle_label"].astype(int)
 
-num_wash_classes    = 5   # trained with 5 wash-cycle classes
-num_iscloth_classes = 2   # {0: NON_CLOTHING, 1: CLOTHING}
+# checkpoint was trained with 5 wash-cycle classes
+num_wash_classes    = 5
+num_iscloth_classes = 2  # {0: NON_CLOTHING, 1: CLOTHING}
 
+# mappings
 color_map_df  = df_clothing[["color_label",  "color_group"]].dropna(subset=["color_group"]).drop_duplicates()
 fabric_map_df = df_clothing[["fabric_label", "fabric_group"]].dropna(subset=["fabric_group"]).drop_duplicates()
 wash_map_df   = wash_all[["wash_cycle_label", "wash_cycle"]].drop_duplicates()
@@ -157,7 +169,7 @@ wash_full_description = {
     "wool/delicate":       "Wool / Delicate – ~20°C, ultra-gentle agitation, very low spin.",
     "delicate/hand-wash":  "Delicate / Hand-wash – 20–30°C, gentle cycle, low spin, ideal for silk and fine fabrics.",
     "normal":              "Normal – 30–40°C, standard agitation and spin for everyday cotton/synthetics.",
-    "normal/delicate":     "Normal / 30°C, slightly gentler mechanical action, medium spin.",
+    "normal/delicate":     "Normal / Delicate – 30°C, slightly gentler mechanical action, medium spin.",
     "synthetic/easy-care": "Synthetic / Easy-care – 30°C, anti-crease profile, moderate spin.",
 }
 
@@ -232,21 +244,17 @@ except Exception as e:
 model.eval()
 
 # ============================================================
-# 4) Strong-filter Single-image prediction
+# 4) Single-image prediction helper
 # ============================================================
 def predict_single_image(pil_img: Image.Image):
     """
-    Strong garment detection filter:
-      - Rejects phone cases, faces, objects.
-      - Accepts real garments (swimsuit, shirt, glove).
+    Run the trained multitask model on a single PIL image.
+
+    Smart gate logic:
+      - If p(is_clothing) < 0.55 -> No garment.
+      - OR if both color & fabric confidences are very low (< 0.35),
+        we also treat it as non-garment (phone, face, random object).
     """
-    import numpy as np
-
-    # 0) Image texture analysis (smooth images -> likely non-garment)
-    img_arr = np.array(pil_img.resize((128, 128))).astype(np.float32)
-    color_std = img_arr.std()   # low std => smooth => probably NOT cloth
-
-    # 1) Model forward
     x = demo_transform(pil_img).unsqueeze(0).to(device)
 
     with torch.no_grad():
@@ -255,7 +263,7 @@ def predict_single_image(pil_img: Image.Image):
         probs_c  = F.softmax(logits_c, dim=1)
         probs_f  = F.softmax(logits_f, dim=1)
         probs_w  = F.softmax(logits_w, dim=1)
-        probs_is = F.softmax(logits_is, dim=1)
+        probs_is = F.softmax(logits_is, dim=1)  # [1, 2]
 
         max_pc, idx_c = probs_c.max(dim=1)
         max_pf, idx_f = probs_f.max(dim=1)
@@ -265,22 +273,24 @@ def predict_single_image(pil_img: Image.Image):
         max_pf = max_pf.item()
         max_pw = max_pw.item()
 
+        # Probability image contains clothing (class 1)
         p_is_cloth = probs_is[0, 1].item()
 
-    # 2) STRONG FILTER RULE
-    cond_A = p_is_cloth >= 0.65
-    cond_B = (max_pc >= 0.45) or (max_pf >= 0.45)
-    cond_C = (color_std >= 18.0)   # smooth -> reject
+        # --------- SMART NON-GARMENT GATE ----------
+        # 1) Not confident that this is clothing
+        # 2) AND/OR color + fabric predictions are too uncertain
+        if (p_is_cloth < 0.55) or (max_pc < 0.35 and max_pf < 0.35):
+            return {
+                "color":  "No garment detected",
+                "fabric": "No garment detected",
+                "wash":   "No washing program suggested — "
+                          "the image does not appear to contain clothing.",
+            }
 
-    if not (cond_A and cond_B and cond_C):
-        return {
-            "color":  "No garment detected",
-            "fabric": "No garment detected",
-            "wash":   "No washing program suggested — "
-                      "the image does not appear to contain clothing.",
-        }
+        # Low-confidence flag for garment predictions
+        LOW_CONF = 0.55
+        low_conf_flag = (min(max_pc, max_pf, max_pw) < LOW_CONF) or (p_is_cloth < 0.7)
 
-    # 3) Garment Prediction
     pc = idx_c.item()
     pf = idx_f.item()
     pw = idx_w.item()
@@ -288,17 +298,16 @@ def predict_single_image(pil_img: Image.Image):
     color_name  = color_map.get(pc,  f"Unknown (id={pc})")
     fabric_name = fabric_map.get(pf, f"Unknown (id={pf})")
 
-    wash_key  = wash_map.get(pw, f"wash_{pw}")
-    full_wash = wash_full_description.get(wash_key, wash_key)
+    wash_key = wash_map.get(pw, f"wash_{pw}")
+    full_wash_text = wash_full_description.get(wash_key, wash_key)
 
-    LOW_CONF = 0.55
-    if min(max_pc, max_pf, max_pw, p_is_cloth) < LOW_CONF:
-        full_wash = "[Low confidence] " + full_wash
+    if low_conf_flag:
+        full_wash_text = "[Low confidence] " + full_wash_text
 
     return {
         "color":  color_name,
         "fabric": fabric_name,
-        "wash":   full_wash,
+        "wash":   full_wash_text,
     }
 
 # ============================================================
@@ -358,6 +367,7 @@ def main():
             else:
                 log_row.to_csv(DEMO_LOG, index=False)
         except Exception:
+            # ignore logging errors (read-only FS, etc.)
             pass
 
         st.success("Prediction done.")
