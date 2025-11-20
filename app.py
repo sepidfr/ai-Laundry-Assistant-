@@ -25,7 +25,6 @@ import streamlit as st
 
 # ============================================================
 # 0) Try to import heavy DL packages (torch, torchvision, timm)
-#    If missing, show a clear error and stop the app.
 # ============================================================
 try:
     import torch
@@ -46,25 +45,19 @@ except ModuleNotFoundError as e:
 # ============================================================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# Local files expected in the repo
 LABELS_CSV = os.path.join(BASE_DIR, "wash_labels.csv")
 HEADER_IMG = os.path.join(BASE_DIR, "ai.jpg")              # optional
 DEMO_LOG   = os.path.join(BASE_DIR, "demo_usage_log.csv")
 
-# Model checkpoint (will be downloaded here)
 CKPT_PATH  = os.path.join(BASE_DIR, "best_model3_wash.pt")
 
-# Google Drive file ID for the model
-# Link:
-#   https://drive.google.com/file/d/1TxEEeU-uTVS-SYq4uzZISDr4gj7CFUsx/view
+# Google Drive ID for the model:
+# https://drive.google.com/file/d/1TxEEeU-uTVS-SYq4uzZISDr4gj7CFUsx/view
 GDRIVE_FILE_ID = "1TxEEeU-uTVS-SYq4uzZISDr4gj7CFUsx"
 
 
 def ensure_model_downloaded():
-    """
-    Download the model checkpoint from Google Drive using gdown
-    if it does not yet exist in the app folder.
-    """
+    """Download model checkpoint from Google Drive using gdown if needed."""
     if os.path.exists(CKPT_PATH):
         return
 
@@ -108,14 +101,12 @@ if "is_clothing" not in df_all.columns:
 
 # ---------- Clothing subset for COLOR / FABRIC heads ----------
 df_clothing = df_all[df_all["is_clothing"] == 1].copy()
-
 if df_clothing.empty:
     st.error("No clothing rows found (`is_clothing == 1`) in `wash_labels.csv`.")
     st.stop()
 
 # Drop rows with missing labels to avoid IntCastingNaNError
 df_clothing = df_clothing.dropna(subset=["color_label", "fabric_label"])
-
 if df_clothing.empty:
     st.error(
         "After dropping rows with missing `color_label`/`fabric_label`, "
@@ -129,19 +120,17 @@ df_clothing["fabric_label"] = df_clothing["fabric_label"].astype(int)
 num_color_classes  = df_clothing["color_label"].nunique()
 num_fabric_classes = df_clothing["fabric_label"].nunique()
 
-# ---------- WASH_CYCLE head: use ALL rows ----------
+# ---------- WASH_CYCLE head ----------
 wash_all = df_all[["wash_cycle_label", "wash_cycle"]].dropna(
     subset=["wash_cycle_label", "wash_cycle"]
 ).copy()
 wash_all["wash_cycle_label"] = wash_all["wash_cycle_label"].astype(int)
 
-# ⚠ VERY IMPORTANT:
-# The checkpoint `best_model3_wash.pt` was trained with 5 wash-cycle classes.
-# So we must keep num_wash_classes = 5 here, even if the CSV currently has fewer labels.
+# checkpoint was trained with 5 wash-cycle classes
 num_wash_classes    = 5
 num_iscloth_classes = 2  # {0: NON_CLOTHING, 1: CLOTHING}
 
-# Clean mappings: label → name
+# mappings
 color_map_df  = df_clothing[["color_label",  "color_group"]].dropna(subset=["color_group"]).drop_duplicates()
 fabric_map_df = df_clothing[["fabric_label", "fabric_group"]].dropna(subset=["fabric_group"]).drop_duplicates()
 wash_map_df   = wash_all[["wash_cycle_label", "wash_cycle"]].drop_duplicates()
@@ -150,15 +139,12 @@ color_map  = dict(zip(color_map_df["color_label"],  color_map_df["color_group"])
 fabric_map = dict(zip(fabric_map_df["fabric_label"], fabric_map_df["fabric_group"]))
 wash_map   = dict(zip(wash_map_df["wash_cycle_label"], wash_map_df["wash_cycle"]))
 
-# Optional: richer verbal descriptions for washing programs.
-# Make sure keys here match the exact strings in wash_cycle column.
 wash_full_description = {
     "wool/delicate":       "Wool / Delicate – ~20°C, ultra-gentle agitation, very low spin.",
     "delicate/hand-wash":  "Delicate / Hand-wash – 20–30°C, gentle cycle, low spin, ideal for silk and fine fabrics.",
     "normal":              "Normal – 30–40°C, standard agitation and spin for everyday cotton/synthetics.",
     "normal/delicate":     "Normal / Delicate – 30°C, slightly gentler mechanical action, medium spin.",
     "synthetic/easy-care": "Synthetic / Easy-care – 30°C, anti-crease profile, moderate spin.",
-    # Add/adjust keys if your CSV has different names
 }
 
 # ============================================================
@@ -185,7 +171,6 @@ class WashMultiTaskConvNeXt(nn.Module):
       • head_fabric     → fabric_group classification
       • head_wash_cycle → wash_cycle classification (5 classes)
       • head_is_cloth   → is_clothing (0 = NON_CLOTHING, 1 = CLOTHING)
-    Must match the architecture used in training.
     """
     def __init__(self, num_color, num_fabric, num_wash, num_iscloth=2):
         super().__init__()
@@ -211,17 +196,15 @@ class WashMultiTaskConvNeXt(nn.Module):
         return logits_color, logits_fabric, logits_wash_cycle, logits_is_cloth
 
 
-# Streamlit Cloud: CPU is the default device
 device = torch.device("cpu")
 
 model = WashMultiTaskConvNeXt(
     num_color=num_color_classes,
     num_fabric=num_fabric_classes,
-    num_wash=num_wash_classes,   # must match checkpoint (5)
+    num_wash=num_wash_classes,
     num_iscloth=num_iscloth_classes,
 ).to(device)
 
-# Load checkpoint
 try:
     state_dict = torch.load(CKPT_PATH, map_location=device)
     model.load_state_dict(state_dict)
@@ -240,15 +223,6 @@ model.eval()
 def predict_single_image(pil_img: Image.Image):
     """
     Run the trained multitask model on a single PIL image.
-
-    Returns
-    -------
-    dict:
-      {
-        "color":  <predicted color_group or message>,
-        "fabric": <predicted fabric_group or message>,
-        "wash":   <human-readable wash program description>,
-      }
     """
     x = demo_transform(pil_img).unsqueeze(0).to(device)
 
@@ -268,13 +242,12 @@ def predict_single_image(pil_img: Image.Image):
         max_pf = max_pf.item()
         max_pw = max_pw.item()
 
-        # Probability that image contains clothing (class 1)
         p_is_cloth = probs_is[0, 1].item()
 
-        # -------- Strong non-garment gate --------
-        # For demo: if the model is not at least 80% sure that this is clothing,
-        # we classify it as "No garment detected".
-        if p_is_cloth < 0.80:
+        # ---------- IS_CLOTHING gate (softer: 0.5) ----------
+        # If the model is less than 50% sure this is clothing,
+        # we treat it as non-garment for the demo.
+        if p_is_cloth < 0.50:
             return {
                 "color":  "No garment detected",
                 "fabric": "No garment detected",
@@ -284,9 +257,8 @@ def predict_single_image(pil_img: Image.Image):
 
         # Low-confidence flag for *garment* predictions
         LOW_CONF = 0.55
-        low_conf_flag = (min(max_pc, max_pf, max_pw) < LOW_CONF) or (p_is_cloth < 0.9)
+        low_conf_flag = (min(max_pc, max_pf, max_pw) < LOW_CONF) or (p_is_cloth < 0.7)
 
-    # Decode labels
     pc = idx_c.item()
     pf = idx_f.item()
     pw = idx_w.item()
@@ -347,7 +319,6 @@ def main():
             st.markdown(f"**Fabric Group:** {result['fabric']}")
             st.markdown(f"**Wash Program:** {result['wash']}")
 
-        # Log usage locally (best-effort)
         ts = datetime.datetime.now().isoformat(timespec="seconds")
         log_row = pd.DataFrame([{
             "timestamp":   ts,
@@ -364,7 +335,6 @@ def main():
             else:
                 log_row.to_csv(DEMO_LOG, index=False)
         except Exception:
-            # If logging fails (e.g., read-only FS), ignore silently
             pass
 
         st.success("Prediction done.")
