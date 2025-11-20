@@ -55,7 +55,7 @@ DEMO_LOG   = os.path.join(BASE_DIR, "demo_usage_log.csv")
 CKPT_PATH  = os.path.join(BASE_DIR, "best_model3_wash.pt")
 
 # Google Drive file ID for the model
-# Link you provided:
+# Link:
 #   https://drive.google.com/file/d/1TxEEeU-uTVS-SYq4uzZISDr4gj7CFUsx/view
 GDRIVE_FILE_ID = "1TxEEeU-uTVS-SYq4uzZISDr4gj7CFUsx"
 
@@ -271,11 +271,10 @@ def predict_single_image(pil_img: Image.Image):
         # Probability that image contains clothing (class 1)
         p_is_cloth = probs_is[0, 1].item()
 
-        VERY_LOW_CONF = 0.30
-        LOW_CONF      = 0.55
-
-        # Non-garment gate
-        if (p_is_cloth < 0.5) and (max_pc < VERY_LOW_CONF) and (max_pf < VERY_LOW_CONF):
+        # -------- Strong non-garment gate --------
+        # For demo: if the model is not at least 80% sure that this is clothing,
+        # we classify it as "No garment detected".
+        if p_is_cloth < 0.80:
             return {
                 "color":  "No garment detected",
                 "fabric": "No garment detected",
@@ -283,7 +282,9 @@ def predict_single_image(pil_img: Image.Image):
                           "the image does not appear to contain clothing.",
             }
 
-        low_conf_flag = (min(max_pc, max_pf, max_pw) < LOW_CONF) or (p_is_cloth < 0.6)
+        # Low-confidence flag for *garment* predictions
+        LOW_CONF = 0.55
+        low_conf_flag = (min(max_pc, max_pf, max_pw) < LOW_CONF) or (p_is_cloth < 0.9)
 
     # Decode labels
     pc = idx_c.item()
