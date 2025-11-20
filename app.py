@@ -45,19 +45,28 @@ except ModuleNotFoundError as e:
 # ============================================================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
+# Local files expected in the repo
 LABELS_CSV = os.path.join(BASE_DIR, "wash_labels.csv")
 HEADER_IMG = os.path.join(BASE_DIR, "ai.jpg")              # optional
 DEMO_LOG   = os.path.join(BASE_DIR, "demo_usage_log.csv")
 
+# Model checkpoint will be saved with this name locally
 CKPT_PATH  = os.path.join(BASE_DIR, "best_model3_wash.pt")
 
-# Google Drive ID for the model:
-# https://drive.google.com/file/d/1TxEEeU-uTVS-SYq4uzZISDr4gj7CFUsx/view
+# Google Drive file ID for the model
+# Link: https://drive.google.com/file/d/1TxEEeU-uTVS-SYq4uzZISDr4gj7CFUsx/view?usp=drive_link
 GDRIVE_FILE_ID = "1TxEEeU-uTVS-SYq4uzZISDr4gj7CFUsx"
 
 
 def ensure_model_downloaded():
-    """Download model checkpoint from Google Drive using gdown if needed."""
+    """
+    Download the model checkpoint from Google Drive using gdown
+    if it does not yet exist in the app folder.
+
+    مهم:
+    - فایل Drive باید share شده باشد روی:
+      'Anyone with the link' -> Viewer
+    """
     if os.path.exists(CKPT_PATH):
         return
 
@@ -70,12 +79,28 @@ def ensure_model_downloaded():
         )
         st.stop()
 
-    url = f"https://drive.google.com/uc?id={GDRIVE_FILE_ID}"
     st.info("Downloading model weights from Google Drive... (this may take a moment)")
-    gdown.download(url, CKPT_PATH, quiet=False)
+
+    try:
+        # استفاده مستقیم از id، نه URL خام
+        gdown.download(id=GDRIVE_FILE_ID, output=CKPT_PATH, quiet=False)
+    except Exception as e:
+        st.error(
+            "Failed to download the model file from Google Drive.\n\n"
+            "Please check that:\n"
+            "  • The file is NOT in Trash\n"
+            "  • Sharing is set to 'Anyone with the link'\n"
+            "  • The File ID is correct: "
+            f"{GDRIVE_FILE_ID}\n\n"
+            f"Raw error from gdown:\n{e}"
+        )
+        st.stop()
 
     if not os.path.exists(CKPT_PATH):
-        st.error("Model download failed – checkpoint file not found after download.")
+        st.error(
+            "Model download finished but `best_model3_wash.pt` was not found.\n"
+            "Please verify the Google Drive file and try again."
+        )
         st.stop()
 
 
@@ -245,8 +270,6 @@ def predict_single_image(pil_img: Image.Image):
         p_is_cloth = probs_is[0, 1].item()
 
         # ---------- IS_CLOTHING gate (softer: 0.5) ----------
-        # If the model is less than 50% sure this is clothing,
-        # we treat it as non-garment for the demo.
         if p_is_cloth < 0.50:
             return {
                 "color":  "No garment detected",
@@ -255,7 +278,7 @@ def predict_single_image(pil_img: Image.Image):
                           "the image does not appear to contain clothing.",
             }
 
-        # Low-confidence flag for *garment* predictions
+        # Low-confidence flag for garment predictions
         LOW_CONF = 0.55
         low_conf_flag = (min(max_pc, max_pf, max_pw) < LOW_CONF) or (p_is_cloth < 0.7)
 
@@ -335,6 +358,7 @@ def main():
             else:
                 log_row.to_csv(DEMO_LOG, index=False)
         except Exception:
+            # ignore logging errors (read-only FS, etc.)
             pass
 
         st.success("Prediction done.")
