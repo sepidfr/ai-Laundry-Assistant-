@@ -1,8 +1,8 @@
-streamlit
-torch
-torchvision
-pillow
+torch==2.2.2
+torchvision==0.17.2
+timm==0.9.16
+gdown==5.1.0
 pandas
+Pillow
+streamlit
 numpy
-timm
-requests
