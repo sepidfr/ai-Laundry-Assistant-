@@ -2,7 +2,7 @@ streamlit
 torch
 torchvision
 timm
-pandas
 numpy
-Pillow
+pandas
 gdown
+Pillow
