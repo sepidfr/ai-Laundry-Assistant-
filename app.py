@@ -295,6 +295,58 @@ def _tta_batch_from_pil(pil_img: Image.Image):
     return torch.stack(imgs, dim=0).to(device)  # [T, 3, H, W]
 
 
+# -------- Robust HSV statistics over garment region (background-invariant) --------
+def compute_hsv_stats_masked(pil_img):
+    """
+    Robust HSV over garment region:
+      - Exclude near-white background (RGB>240) OR (S<0.08 & V>0.92)
+      - Use median instead of mean
+      - Fallback: center crop if mask too small
+    Returns (H_med, S_med, V_med, frac_light)
+    """
+    img = pil_img.convert("RGB")
+    arr = np.asarray(img, dtype=np.float32) / 255.0
+    R, G, B = arr[...,0], arr[...,1], arr[...,2]
+
+    # RGB→HSV (vectorized)
+    maxc = arr.max(axis=-1); minc = arr.min(axis=-1); delta = maxc - minc + 1e-12
+    V = maxc
+    S = (delta / (maxc + 1e-12))
+    H = np.zeros_like(V)
+    mask_r = (maxc == R)
+    mask_g = (maxc == G)
+    mask_b = (maxc == B)
+    H[mask_r] = (G[mask_r]-B[mask_r]) / delta[mask_r]
+    H[mask_g] = 2.0 + (B[mask_g]-R[mask_g]) / delta[mask_g]
+    H[mask_b] = 4.0 + (R[mask_b]-G[mask_b]) / delta[mask_b]
+    H = (H/6.0) % 1.0
+
+    # Background suppression
+    near_white_rgb = (R>0.94) & (G>0.94) & (B>0.94)
+    near_white_hsv = (S<0.08) & (V>0.92)
+    fg = ~(near_white_rgb | near_white_hsv)
+
+    # Fallback if too small
+    if fg.sum() < 500:
+        h, w = V.shape
+        y0, y1 = int(0.1*h), int(0.9*h)
+        x0, x1 = int(0.1*w), int(0.9*w)
+        fg = np.zeros_like(V, dtype=bool)
+        fg[y0:y1, x0:x1] = True
+
+    Hf = H[fg]; Sf = S[fg]; Vf = V[fg]
+
+    # Fraction of pixels that are "very light" (pastel-like)
+    pastel_A = (Sf < 0.18) & (Vf > 0.70)
+    pastel_B = (Sf < 0.30) & (Vf > 0.88)
+    frac_light = float((pastel_A | pastel_B).mean()) if Sf.size else 0.0
+
+    H_med = float(np.median(Hf)) if Hf.size else 0.0
+    S_med = float(np.median(Sf)) if Sf.size else 0.0
+    V_med = float(np.median(Vf)) if Vf.size else 0.0
+    return H_med, S_med, V_med, frac_light
+
+
 def predict_single_image(pil_img: Image.Image):
     """
     Run the trained multitask model on a single PIL image.
@@ -304,6 +356,7 @@ def predict_single_image(pil_img: Image.Image):
       - Class-prior correction on FABRIC logits
       - Mild temperature sharpening on FABRIC logits
       - Wool/Silk/Synthetic-aware consistency rules using wash-cycle head
+      - Robust HSV lightness rule (background-invariant) for COLOR→LIGHT override
 
     Smart gate logic:
       - If p(is_clothing) < 0.55 -> No garment.
@@ -416,32 +469,17 @@ def predict_single_image(pil_img: Image.Image):
     full_wash_text = wash_full_description.get(wash_key, wash_key)
 
     # ============================================================
-    # COLOR LIGHT RULE (very low saturation + high brightness → LIGHT)
-    # Works for all hues (pink/blue/green/gray, etc.)
-    # Two-tier trigger to catch very pale colors reliably.
+    # COLOR LIGHT RULE (robust, background-invariant)
+    # Only flip to LIGHT if a large fraction of garment pixels are pastel-like.
     # ============================================================
-    def compute_hsv_stats(pil_img_local):
-        import numpy as _np
-        import colorsys as _colorsys
-        img_local = pil_img_local.convert("RGB")
-        arr = _np.asarray(img_local, dtype=_np.float32) / 255.0
-        H_sum = S_sum = V_sum = 0.0
-        n = arr.shape[0] * arr.shape[1]
-        for i in range(arr.shape[0]):
-            row = arr[i]
-            for j in range(row.shape[0]):
-                r, g, b = row[j]
-                h, s, v = _colorsys.rgb_to_hsv(float(r), float(g), float(b))
-                H_sum += h; S_sum += s; V_sum += v
-        return (H_sum / n), (S_sum / n), (V_sum / n)
+    H_med, S_med, V_med, frac_light = compute_hsv_stats_masked(pil_img)
 
-    H_mean, S_mean, V_mean = compute_hsv_stats(pil_img)
-    SAT_LOW_A   = 0.18   # very low saturation (pastel)
-    BRIGHT_HIGH = 0.70   # high brightness
-    SAT_LOW_B   = 0.30   # low/moderate saturation
-    BRIGHT_VERY = 0.88   # extremely bright
+    # Requirements to override to LIGHT
+    RATIO_THRESH   = 0.60   # at least 60% of garment pixels are very light
+    S_MED_MAX      = 0.25   # median saturation must be low
+    V_MED_MIN      = 0.82   # median brightness must be high
 
-    if (S_mean < SAT_LOW_A and V_mean > BRIGHT_HIGH) or (S_mean < SAT_LOW_B and V_mean > BRIGHT_VERY):
+    if (frac_light >= RATIO_THRESH) and (S_med <= S_MED_MAX) and (V_med >= V_MED_MIN):
         color_name = "LIGHT"
 
     if low_conf_flag:
