@@ -173,6 +173,25 @@ wash_full_description = {
     "synthetic/easy-care": "Synthetic / Easy-care – 30°C, anti-crease profile, moderate spin.",
 }
 
+# ----- Class-prior correction for FABRIC (empirical priors from CSV) -----
+import numpy as np
+fabric_counts = df_clothing["fabric_label"].value_counts().sort_index()
+_eps = 1e-6
+_full_counts = np.full((num_fabric_classes,), _eps, dtype=np.float32)
+for k, v in fabric_counts.items():
+    if 0 <= k < num_fabric_classes:
+        _full_counts[k] = float(v)
+fabric_priors = _full_counts / _full_counts.sum()
+fabric_log_priors = torch.from_numpy(np.log(fabric_priors)).float()
+PRIOR_ALPHA = 0.8  # strength of prior correction (0..1)
+
+# ----- Find label id for WOOL (case-insensitive contains "wool") -----
+wool_label_id = None
+for k, v in fabric_map.items():
+    if isinstance(v, str) and ("wool" in v.lower()):
+        wool_label_id = int(k)
+        break
+
 # ============================================================
 # 3) Model + preprocessing transforms
 # ============================================================
@@ -244,27 +263,68 @@ except Exception as e:
 model.eval()
 
 # ============================================================
-# 4) Single-image prediction helper
+# 4) Single-image prediction helper (TTA + prior correction + wool rule)
 # ============================================================
+def _tta_batch_from_pil(pil_img: Image.Image):
+    # Build a small TTA set: original, hflip, and a slightly resized+center-crop
+    imgs = []
+    base = pil_img.copy()
+    imgs.append(demo_transform(base))
+    imgs.append(demo_transform(base.transpose(Image.FLIP_LEFT_RIGHT)))
+    # slightly different scale → more texture robustness
+    t_resize = transforms.Resize(int(IMG_SIZE * 1.10))
+    t_center = transforms.CenterCrop(IMG_SIZE)
+    tta_alt = transforms.Compose([
+        t_resize, t_center,
+        transforms.ToTensor(),
+        transforms.Normalize([0.485,0.456,0.406],[0.229,0.224,0.225])
+    ])
+    imgs.append(tta_alt(base))
+    return torch.stack(imgs, dim=0).to(device)  # [T, 3, H, W]
+
+
 def predict_single_image(pil_img: Image.Image):
     """
     Run the trained multitask model on a single PIL image.
+
+    Enhancements:
+      - Test-Time Augmentation (TTA) + logits averaging
+      - Class-prior correction on FABRIC logits
+      - Wool-aware consistency rule using wash-cycle head
 
     Smart gate logic:
       - If p(is_clothing) < 0.55 -> No garment.
       - OR if both color & fabric confidences are very low (< 0.35),
         we also treat it as non-garment (phone, face, random object).
     """
-    x = demo_transform(pil_img).unsqueeze(0).to(device)
+    x = _tta_batch_from_pil(pil_img)  # [T, C, H, W]
 
     with torch.no_grad():
-        logits_c, logits_f, logits_w, logits_is = model(x)
+        logits_c_list, logits_f_list, logits_w_list, logits_is_list = [], [], [], []
+        for t in range(x.size(0)):
+            lc, lf, lw, lis = model(x[t].unsqueeze(0))
+            logits_c_list.append(lc)
+            logits_f_list.append(lf)
+            logits_w_list.append(lw)
+            logits_is_list.append(lis)
 
+        # Average logits across TTA
+        logits_c = torch.mean(torch.stack(logits_c_list, dim=0), dim=0)   # [1, Cc]
+        logits_f = torch.mean(torch.stack(logits_f_list, dim=0), dim=0)   # [1, Cf]
+        logits_w = torch.mean(torch.stack(logits_w_list, dim=0), dim=0)   # [1, Cw]
+        logits_is = torch.mean(torch.stack(logits_is_list, dim=0), dim=0) # [1, 2]
+
+        # Prior correction on FABRIC (Bayes de-biasing)
+        if fabric_log_priors.numel() == logits_f.shape[1]:
+            logits_f = logits_f - PRIOR_ALPHA * fabric_log_priors.to(device).unsqueeze(0)
+
+        # Convert to probabilities
         probs_c  = F.softmax(logits_c, dim=1)
         probs_f  = F.softmax(logits_f, dim=1)
         probs_w  = F.softmax(logits_w, dim=1)
         probs_is = F.softmax(logits_is, dim=1)  # [1, 2]
 
+        # Argmax + confidences
         max_pc, idx_c = probs_c.max(dim=1)
         max_pf, idx_f = probs_f.max(dim=1)
         max_pw, idx_w = probs_w.max(dim=1)
@@ -272,13 +332,9 @@ def predict_single_image(pil_img: Image.Image):
         max_pc = max_pc.item()
         max_pf = max_pf.item()
         max_pw = max_pw.item()
-
-        # Probability image contains clothing (class 1)
         p_is_cloth = probs_is[0, 1].item()
 
         # --------- SMART NON-GARMENT GATE ----------
-        # 1) Not confident that this is clothing
-        # 2) AND/OR color + fabric predictions are too uncertain
         if (p_is_cloth < 0.55) or (max_pc < 0.35 and max_pf < 0.35):
             return {
                 "color":  "No garment detected",
@@ -289,11 +345,32 @@ def predict_single_image(pil_img: Image.Image):
 
         # Low-confidence flag for garment predictions
         LOW_CONF = 0.55
-        low_conf_flag = (min(max_pc, max_pf, max_pw) < LOW_CONF) or (p_is_cloth < 0.7)
+        low_conf_flag = (min(max_pc, max_pf, max_pw) < LOW_CONF) or (p_is_cloth < 0.70)
 
-    pc = idx_c.item()
-    pf = idx_f.item()
-    pw = idx_w.item()
+        # IDs
+        pc = idx_c.item()
+        pf = idx_f.item()
+        pw = idx_w.item()
+
+        # --- Wool-aware rule: if wash-cycle suggests delicate/wool and WOOL is close second, prefer WOOL ---
+        # Find top-2 for fabric:
+        topk = min(2, probs_f.shape[1])
+        top2_vals, top2_idx = torch.topk(probs_f[0], k=topk)
+        pf1_id  = int(top2_idx[0].item())
+        pf2_id  = int(top2_idx[1].item()) if topk > 1 else pf1_id
+        pf1_p   = float(top2_vals[0].item())
+        pf2_p   = float(top2_vals[1].item()) if topk > 1 else pf1_p
+
+        wash_key = wash_map.get(pw, f"wash_{pw}")
+        woolish_cycle = isinstance(wash_key, str) and (
+            ("wool" in wash_key.lower()) or ("delicate" in wash_key.lower()) or ("hand" in wash_key.lower())
+        )
+
+        if wool_label_id is not None and woolish_cycle:
+            EPS = 0.10  # tolerance to switch if WOOL is runner-up and close
+            if pf1_id != wool_label_id and (pf2_id == wool_label_id) and ((pf1_p - pf2_p) <= EPS):
+                pf = wool_label_id
+                max_pf = pf2_p  # update displayed confidence thresholding if used downstream
 
     color_name  = color_map.get(pc,  f"Unknown (id={pc})")
     fabric_name = fabric_map.get(pf, f"Unknown (id={pf})")
