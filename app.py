@@ -469,18 +469,47 @@ def predict_single_image(pil_img: Image.Image):
     full_wash_text = wash_full_description.get(wash_key, wash_key)
 
     # ============================================================
-    # COLOR LIGHT RULE (robust, background-invariant)
-    # Only flip to LIGHT if a large fraction of garment pixels are pastel-like.
+    # COLOR LIGHT RULE (final, pastel-aware + explicit COLOR guards)
+    #  - Strong colors (S_med > 0.30) never LIGHT
+    #  - Explicit COLOR guards for Green & Red/Magenta when S_med >= 0.22
+    #  - Creamy Yellow and Light Blue can be LIGHT under stricter thresholds
+    #  - Otherwise use global pastel ratio fallback
     # ============================================================
     H_med, S_med, V_med, frac_light = compute_hsv_stats_masked(pil_img)
 
-    # Requirements to override to LIGHT
-    RATIO_THRESH   = 0.60   # at least 60% of garment pixels are very light
-    S_MED_MAX      = 0.25   # median saturation must be low
-    V_MED_MIN      = 0.82   # median brightness must be high
+    # Global pastel thresholds
+    RATIO_THRESH   = 0.60
+    S_MED_MAX      = 0.25
+    V_MED_MIN      = 0.82
 
-    if (frac_light >= RATIO_THRESH) and (S_med <= S_MED_MAX) and (V_med >= V_MED_MIN):
-        color_name = "LIGHT"
+    # Hue windows (HSV hue in [0,1])
+    is_yellow_orange = (0.05 <= H_med <= 0.18)   # orange→yellow
+    is_cyan_blue     = (0.45 <= H_med <= 0.70)   # cyan→blue
+    is_green         = (0.25 <= H_med <= 0.45)   # green band
+    is_red_magenta   = (H_med <= 0.03) or (H_med >= 0.93) or (0.80 <= H_med <= 0.93)
+
+    # STRONG COLOR GUARD: reasonably saturated garment → never LIGHT
+    if S_med > 0.30:
+        pass
+    else:
+        # Explicit COLOR guard for greens and reds/magentas (your requested addition)
+        if (is_green or is_red_magenta) and (S_med >= 0.22):
+            pass  # keep COLOR/COLORFUL; do not flip to LIGHT
+        else:
+            allow_light = False
+
+            # Creamy yellow (very pale) → LIGHT
+            if is_yellow_orange and (S_med <= 0.14) and (V_med >= 0.90):
+                allow_light = True
+            # Light blue/cyan (pale) → LIGHT
+            elif is_cyan_blue and (S_med <= 0.22) and (V_med >= 0.88):
+                allow_light = True
+            # Generic pastel fallback for other hues
+            elif (frac_light >= RATIO_THRESH) and (S_med <= S_MED_MAX) and (V_MED_MIN <= V_med):
+                allow_light = True
+
+            if allow_light:
+                color_name = "LIGHT"
 
     if low_conf_flag:
         full_wash_text = "[Low confidence] " + full_wash_text
