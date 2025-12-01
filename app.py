@@ -415,6 +415,35 @@ def predict_single_image(pil_img: Image.Image):
     wash_key = wash_map.get(pw, f"wash_{pw}")
     full_wash_text = wash_full_description.get(wash_key, wash_key)
 
+    # ============================================================
+    # COLOR LIGHT RULE (very low saturation + high brightness → LIGHT)
+    # Works for all hues (pink/blue/green/gray, etc.)
+    # Two-tier trigger to catch very pale colors reliably.
+    # ============================================================
+    def compute_hsv_stats(pil_img_local):
+        import numpy as _np
+        import colorsys as _colorsys
+        img_local = pil_img_local.convert("RGB")
+        arr = _np.asarray(img_local, dtype=_np.float32) / 255.0
+        H_sum = S_sum = V_sum = 0.0
+        n = arr.shape[0] * arr.shape[1]
+        for i in range(arr.shape[0]):
+            row = arr[i]
+            for j in range(row.shape[0]):
+                r, g, b = row[j]
+                h, s, v = _colorsys.rgb_to_hsv(float(r), float(g), float(b))
+                H_sum += h; S_sum += s; V_sum += v
+        return (H_sum / n), (S_sum / n), (V_sum / n)
+
+    H_mean, S_mean, V_mean = compute_hsv_stats(pil_img)
+    SAT_LOW_A   = 0.18   # very low saturation (pastel)
+    BRIGHT_HIGH = 0.70   # high brightness
+    SAT_LOW_B   = 0.30   # low/moderate saturation
+    BRIGHT_VERY = 0.88   # extremely bright
+
+    if (S_mean < SAT_LOW_A and V_mean > BRIGHT_HIGH) or (S_mean < SAT_LOW_B and V_mean > BRIGHT_VERY):
+        color_name = "LIGHT"
+
     if low_conf_flag:
         full_wash_text = "[Low confidence] " + full_wash_text
 
