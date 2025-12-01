@@ -192,6 +192,18 @@ for k, v in fabric_map.items():
         wool_label_id = int(k)
         break
 
+# ----- Find label id for SILK and SYNTHETIC (case-insensitive contains) -----
+silk_label_id = None
+synthetic_label_id = None
+for k, v in fabric_map.items():
+    if isinstance(v, str):
+        name = v.lower()
+        if ("silk" in name) and (silk_label_id is None):
+            silk_label_id = int(k)
+        # match "synthetic" or common variants like "poly", "polyester"
+        if (("synthetic" in name) or ("poly" in name)) and (synthetic_label_id is None):
+            synthetic_label_id = int(k)
+
 # ============================================================
 # 3) Model + preprocessing transforms
 # ============================================================
@@ -263,7 +275,7 @@ except Exception as e:
 model.eval()
 
 # ============================================================
-# 4) Single-image prediction helper (TTA + prior correction + wool rule)
+# 4) Single-image prediction helper (TTA + prior correction + fabric rules)
 # ============================================================
 def _tta_batch_from_pil(pil_img: Image.Image):
     # Build a small TTA set: original, hflip, and a slightly resized+center-crop
@@ -290,7 +302,8 @@ def predict_single_image(pil_img: Image.Image):
     Enhancements:
       - Test-Time Augmentation (TTA) + logits averaging
       - Class-prior correction on FABRIC logits
-      - Wool-aware consistency rule using wash-cycle head
+      - Mild temperature sharpening on FABRIC logits
+      - Wool/Silk/Synthetic-aware consistency rules using wash-cycle head
 
     Smart gate logic:
       - If p(is_clothing) < 0.55 -> No garment.
@@ -317,6 +330,10 @@ def predict_single_image(pil_img: Image.Image):
         # Prior correction on FABRIC (Bayes de-biasing)
         if fabric_log_priors.numel() == logits_f.shape[1]:
             logits_f = logits_f - PRIOR_ALPHA * fabric_log_priors.to(device).unsqueeze(0)
+
+        # Mild temperature sharpening for FABRIC
+        FABRIC_TEMPERATURE = 0.9  # <1 sharpens slightly
+        logits_f = logits_f / FABRIC_TEMPERATURE
 
         # Convert to probabilities
         probs_c  = F.softmax(logits_c, dim=1)
@@ -352,8 +369,7 @@ def predict_single_image(pil_img: Image.Image):
         pf = idx_f.item()
         pw = idx_w.item()
 
-        # --- Wool-aware rule: if wash-cycle suggests delicate/wool and WOOL is close second, prefer WOOL ---
-        # Find top-2 for fabric:
+        # --- Fabric top-2 for post-rules ---
         topk = min(2, probs_f.shape[1])
         top2_vals, top2_idx = torch.topk(probs_f[0], k=topk)
         pf1_id  = int(top2_idx[0].item())
@@ -362,15 +378,36 @@ def predict_single_image(pil_img: Image.Image):
         pf2_p   = float(top2_vals[1].item()) if topk > 1 else pf1_p
 
         wash_key = wash_map.get(pw, f"wash_{pw}")
+
+        # --- Wool-aware rule: if wash-cycle suggests delicate/wool and WOOL is close second, prefer WOOL ---
         woolish_cycle = isinstance(wash_key, str) and (
             ("wool" in wash_key.lower()) or ("delicate" in wash_key.lower()) or ("hand" in wash_key.lower())
         )
-
         if wool_label_id is not None and woolish_cycle:
-            EPS = 0.10  # tolerance to switch if WOOL is runner-up and close
-            if pf1_id != wool_label_id and (pf2_id == wool_label_id) and ((pf1_p - pf2_p) <= EPS):
+            EPS_WOOL = 0.10
+            if pf1_id != wool_label_id and (pf2_id == wool_label_id) and ((pf1_p - pf2_p) <= EPS_WOOL):
                 pf = wool_label_id
-                max_pf = pf2_p  # update displayed confidence thresholding if used downstream
+                max_pf = pf2_p  # for any downstream use
+
+        # --- Silk-aware rule: delicate/hand-wash implies silk if close second ---
+        silkish_cycle = isinstance(wash_key, str) and (
+            ("silk" in wash_key.lower()) or ("delicate" in wash_key.lower()) or ("hand" in wash_key.lower())
+        )
+        if silk_label_id is not None and silkish_cycle:
+            EPS_SILK = 0.08  # slightly stricter than wool
+            if pf1_id != silk_label_id and (pf2_id == silk_label_id) and ((pf1_p - pf2_p) <= EPS_SILK):
+                pf = silk_label_id
+                max_pf = pf2_p
+
+        # --- Synthetic-aware rule: synthetic/easy-care implies synthetic if close second ---
+        synthetic_cycle = isinstance(wash_key, str) and (
+            ("synthetic" in wash_key.lower()) or ("easy-care" in wash_key.lower()) or ("easycare" in wash_key.lower())
+        )
+        if synthetic_label_id is not None and synthetic_cycle:
+            EPS_SYN = 0.10
+            if pf1_id != synthetic_label_id and (pf2_id == synthetic_label_id) and ((pf1_p - pf2_p) <= EPS_SYN):
+                pf = synthetic_label_id
+                max_pf = pf2_p
 
     color_name  = color_map.get(pc,  f"Unknown (id={pc})")
     fabric_name = fabric_map.get(pf, f"Unknown (id={pf})")
