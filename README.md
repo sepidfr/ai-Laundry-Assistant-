@@ -18,7 +18,7 @@ https://www.kaggle.com/code/gpreda/h-m-eda-and-prediction/input
 # About the Notebook Files
 
 The full training notebook is large due to the dataset size and preprocessing pipeline.
-To keep the repository lightweight and avoid GitHub upload limits, the notebook is included as a #ZIP file.
+To keep the repository lightweight and avoid GitHub upload limits, the notebook is included as a ZIP file.
 
 You can extract the ZIP and run the notebook directly without any modifications.
 
